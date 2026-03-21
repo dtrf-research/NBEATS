@@ -1,0 +1,17 @@
+# Ignore data files
+*.csv
+
+# Ignore logs
+logs/
+darts_logs/
+
+# Ignore models
+models/
+results/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore temp / misc
+*.log
