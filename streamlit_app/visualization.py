@@ -152,19 +152,49 @@ def build_blending_chart(
         line=dict(color="#EF553B", width=2.5),
     ))
 
-    # Individual model predictions (optional, dotted)
+    # Individual model predictions — clipped to their scheduled segments
     if show_individuals:
+        # Build a map of model → list of (start, end) from schedule
+        _model_segments: Dict[str, List[tuple]] = {}
+        for entry in schedule:
+            mname = entry["model"]
+            _model_segments.setdefault(mname, []).append(
+                (pd.Timestamp(entry["start"]), pd.Timestamp(entry["end"]))
+            )
+
         for idx, (model_name, pred_df) in enumerate(individual_preds.items()):
             short_name = _short_label(model_name)
             color = _COLORS[(idx + 2) % len(_COLORS)]
-            fig.add_trace(go.Scatter(
-                x=pred_df["Timestamp"],
-                y=pred_df["Predicted"],
-                mode="lines",
-                name=short_name,
-                line=dict(color=color, width=1, dash="dot"),
-                opacity=0.55,
-            ))
+            segments = _model_segments.get(model_name, [])
+            if segments:
+                # Plot only the portions within scheduled segments
+                for seg_start, seg_end in segments:
+                    seg_df = pred_df[
+                        (pred_df["Timestamp"] >= seg_start)
+                        & (pred_df["Timestamp"] < seg_end)
+                    ]
+                    if seg_df.empty:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=seg_df["Timestamp"],
+                        y=seg_df["Predicted"],
+                        mode="lines",
+                        name=short_name,
+                        legendgroup=model_name,
+                        showlegend=(seg_start == segments[0][0]),
+                        line=dict(color=color, width=1.5, dash="dot"),
+                        opacity=0.7,
+                    ))
+            else:
+                # Fallback model — show across entire range (dimmer)
+                fig.add_trace(go.Scatter(
+                    x=pred_df["Timestamp"],
+                    y=pred_df["Predicted"],
+                    mode="lines",
+                    name=f"{short_name} (fallback)",
+                    line=dict(color=color, width=1, dash="dot"),
+                    opacity=0.35,
+                ))
 
     # Segment background shading
     for idx, entry in enumerate(schedule):

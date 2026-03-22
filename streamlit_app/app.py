@@ -424,27 +424,23 @@ else:
             else:
                 st.error("Invalid entry — ensure models are selected and start < end.")
 
-    # --- Display current schedule ---
+    # --- Display current schedule with per-row remove buttons ---
     if schedule:
         st.markdown("**Current schedule:**")
-        sched_display = []
         for idx, entry in enumerate(schedule):
-            sched_display.append({
-                "#": idx + 1,
-                "Start": entry["start"],
-                "End": entry["end"],
-                "Model": entry["model"],
-            })
-        st.dataframe(pd.DataFrame(sched_display), use_container_width=True, hide_index=True)
+            short_model = entry["model"].split("_")[1] if "_" in entry["model"] else entry["model"]
+            cols = st.columns([2, 2, 4, 1])
+            cols[0].text(entry["start"])
+            cols[1].text(entry["end"])
+            cols[2].text(entry["model"])
+            if cols[3].button("🗑️", key=f"rm_sched_{idx}", help=f"Remove entry {idx + 1}"):
+                schedule.pop(idx)
+                st.session_state["blend_schedules"][schedule_key] = schedule
+                st.rerun()
 
-        # Remove entry
-        remove_idx = st.number_input(
-            "Remove entry # (0 = none)", min_value=0, max_value=len(schedule),
-            value=0, step=1, key="remove_idx",
-        )
-        if st.button("Remove", key="remove_entry_btn") and remove_idx > 0:
-            schedule.pop(remove_idx - 1)
-            st.session_state["blend_schedules"][schedule_key] = schedule
+        # Clear all button
+        if st.button("🗑️ Clear All Entries", key="clear_all_sched"):
+            st.session_state["blend_schedules"][schedule_key] = []
             st.rerun()
     else:
         st.info("No schedule entries yet. Add one above.")

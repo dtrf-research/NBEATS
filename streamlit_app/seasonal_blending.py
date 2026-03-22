@@ -68,35 +68,51 @@ def apply_hard_merge(
     """
     Build a single merged prediction series using timestamp-level assignment.
 
+    Only timestamps that fall within at least one schedule segment are kept.
+    The fallback model is used to fill NaN gaps **within** scheduled segments
+    (e.g. when the assigned model has missing predictions), but timestamps
+    outside all schedule segments are excluded entirely.
+
     Parameters
     ----------
     predictions_dict : {model_name: DataFrame[Timestamp, Actual, Predicted]}
     schedule : list of {start, end, model} dicts — later entries win on overlap
-    fallback_model : model to use for timestamps not covered by any entry
+    fallback_model : model to fill NaN gaps inside scheduled segments
 
     Returns
     -------
     DataFrame[Timestamp, Actual, Predicted, Source] aligned with existing format.
     """
-    # Collect all unique prediction timestamps with actuals from fallback
     if fallback_model not in predictions_dict:
         raise ValueError(f"Fallback model '{fallback_model}' has no predictions.")
 
     base_df = predictions_dict[fallback_model][["Timestamp", "Actual"]].copy()
     base_df = base_df.sort_values("Timestamp").reset_index(drop=True)
 
-    merged_pred = np.full(len(base_df), np.nan)
-    source = np.full(len(base_df), fallback_model, dtype=object)
     timestamps = base_df["Timestamp"].values
 
-    # Apply schedule entries in order — later entries override earlier ones
+    # 1. Build a boolean mask of timestamps covered by ANY schedule segment
+    in_any_segment = np.zeros(len(base_df), dtype=bool)
+    for entry in schedule:
+        s = pd.Timestamp(entry["start"]).to_numpy()
+        e = pd.Timestamp(entry["end"]).to_numpy()
+        in_any_segment |= (timestamps >= s) & (timestamps < e)
+
+    # Keep only timestamps within scheduled segments
+    base_df = base_df[in_any_segment].reset_index(drop=True)
+    timestamps = base_df["Timestamp"].values
+
+    merged_pred = np.full(len(base_df), np.nan)
+    source = np.full(len(base_df), "", dtype=object)
+
+    # 2. Apply schedule entries in order — later entries override earlier ones
     for entry in schedule:
         model_name = entry["model"]
         if model_name not in predictions_dict:
             continue
-        s = pd.Timestamp(entry["start"])
-        e = pd.Timestamp(entry["end"])
-        mask = (timestamps >= s.to_numpy()) & (timestamps < e.to_numpy())
+        s = pd.Timestamp(entry["start"]).to_numpy()
+        e = pd.Timestamp(entry["end"]).to_numpy()
+        mask = (timestamps >= s) & (timestamps < e)
         if not mask.any():
             continue
 
@@ -107,14 +123,14 @@ def apply_hard_merge(
                 merged_pred[i] = model_pred[ts]
                 source[i] = model_name
 
-    # Fill remaining NaN with fallback model
+    # 3. Fill remaining NaN (within segments) with fallback model
     fallback_pred = predictions_dict[fallback_model].set_index("Timestamp")["Predicted"]
     nan_mask = np.isnan(merged_pred)
     for i in np.where(nan_mask)[0]:
         ts = pd.Timestamp(timestamps[i])
         if ts in fallback_pred.index:
             merged_pred[i] = fallback_pred[ts]
-            source[i] = fallback_model
+            source[i] = f"{fallback_model} (fallback)"
 
     result = base_df.copy()
     result["Predicted"] = merged_pred
