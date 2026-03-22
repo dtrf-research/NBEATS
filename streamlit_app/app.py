@@ -45,18 +45,28 @@ from model_loader import (
     load_scaler,
     model_display_label,
 )
-from visualization import build_comparison_chart, build_error_chart
+from visualization import (
+    build_blending_chart,
+    build_blending_error_chart,
+    build_comparison_chart,
+    build_error_chart,
+)
+from seasonal_blending import (
+    apply_hard_merge,
+    apply_soft_transition,
+    compute_contribution_summary,
+    compute_segment_metrics,
+    validate_schedule,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="N-BEATS Model Comparison",
+    page_title="N-BEATS Dashboard",
     page_icon="📈",
     layout="wide",
 )
-
-st.title("📈 N-BEATS Model Comparison Dashboard")
 
 # ---------------------------------------------------------------------------
 # Cached loaders
@@ -91,6 +101,21 @@ model_names = list_models(registry)
 min_date, max_date = get_date_bounds(df_raw)
 
 # ---------------------------------------------------------------------------
+# Sidebar – mode switch
+# ---------------------------------------------------------------------------
+app_mode = st.sidebar.radio(
+    "Dashboard Mode",
+    ["📈 Model Comparison", "🌾 Seasonal Blending"],
+    index=0,
+    horizontal=True,
+)
+
+if app_mode == "📈 Model Comparison":
+    st.title("📈 N-BEATS Model Comparison Dashboard")
+else:
+    st.title("🌾 Seasonal Model Blending")
+
+# ---------------------------------------------------------------------------
 # Sidebar – controls
 # ---------------------------------------------------------------------------
 st.sidebar.header("⚙️ Evaluation Settings")
@@ -115,129 +140,336 @@ st.sidebar.header("🧠 Model Selection")
 display_labels = {name: model_display_label(name, registry[name]) for name in model_names}
 label_to_name = {v: k for k, v in display_labels.items()}
 
-selected_labels = st.sidebar.multiselect(
-    "Choose models to compare",
-    options=list(label_to_name.keys()),
-    default=[],
-)
-selected_models = [label_to_name[lbl] for lbl in selected_labels]
-
-run_button = st.sidebar.button("🚀 Run Evaluation", type="primary", use_container_width=True)
-
-# ---------------------------------------------------------------------------
-# Main area
-# ---------------------------------------------------------------------------
-
-if not selected_models:
-    st.info("Select one or more models from the sidebar, choose a region & date range, then press **Run Evaluation**.")
-    st.stop()
-
-if not run_button:
-    st.warning("Press **Run Evaluation** to generate predictions.")
-    st.stop()
-
-if start_date >= end_date:
-    st.error("Start date must be before end date.")
-    st.stop()
-
-# ---- Filter data ----
-with st.spinner("Filtering data …"):
-    df_filtered = filter_data(
-        df_raw,
-        zone,
-        str(start_date),
-        str(end_date),
-        months if months else None,
-    )
-
-if df_filtered.empty:
-    st.error("No data found for the selected filters.")
-    st.stop()
-
-st.caption(f"📊 Evaluation data: **{len(df_filtered):,}** rows from **{start_date}** to **{end_date}**")
-
-# ---- Load models & run inference ----
-predictions: dict[str, pd.DataFrame] = {}
-metrics_table: list[dict] = []
-progress = st.progress(0, text="Loading models & running inference …")
-
 import json as _json
 
-for i, model_name in enumerate(selected_models):
-    entry = registry[model_name]
-    entry_json = _json.dumps(entry)
+# ===================================================================
+# MODE A – Model Comparison  (original flow, untouched)
+# ===================================================================
+if app_mode == "📈 Model Comparison":
+    selected_labels = st.sidebar.multiselect(
+        "Choose models to compare",
+        options=list(label_to_name.keys()),
+        default=[],
+    )
+    selected_models = [label_to_name[lbl] for lbl in selected_labels]
 
-    progress.progress(
-        (i) / len(selected_models),
-        text=f"Running **{model_name}** ({i + 1}/{len(selected_models)}) …",
+    run_button = st.sidebar.button("🚀 Run Evaluation", type="primary", use_container_width=True)
+
+    if not selected_models:
+        st.info("Select one or more models from the sidebar, choose a region & date range, then press **Run Evaluation**.")
+        st.stop()
+
+    if not run_button:
+        st.warning("Press **Run Evaluation** to generate predictions.")
+        st.stop()
+
+    if start_date >= end_date:
+        st.error("Start date must be before end date.")
+        st.stop()
+
+    # ---- Filter data ----
+    with st.spinner("Filtering data …"):
+        df_filtered = filter_data(
+            df_raw,
+            zone,
+            str(start_date),
+            str(end_date),
+            months if months else None,
+        )
+
+    if df_filtered.empty:
+        st.error("No data found for the selected filters.")
+        st.stop()
+
+    st.caption(f"📊 Evaluation data: **{len(df_filtered):,}** rows from **{start_date}** to **{end_date}**")
+
+    # ---- Load models & run inference ----
+    predictions: dict[str, pd.DataFrame] = {}
+    metrics_table: list[dict] = []
+    progress = st.progress(0, text="Loading models & running inference …")
+
+    for i, model_name in enumerate(selected_models):
+        entry = registry[model_name]
+        entry_json = _json.dumps(entry)
+
+        progress.progress(
+            (i) / len(selected_models),
+            text=f"Running **{model_name}** ({i + 1}/{len(selected_models)}) …",
+        )
+
+        model, scaler = _load_model_cached(model_name, entry_json)
+
+        result_df = run_inference(model, scaler, df_filtered, zone)
+
+        if result_df.empty:
+            st.warning(f"No predictions for **{model_name}** — series may be too short for the model's input length.")
+            continue
+
+        predictions[model_name] = result_df
+
+        # Metrics
+        m = compute_metrics(result_df["Actual"].values, result_df["Predicted"].values)
+        m["Model"] = model_name
+        metrics_table.append(m)
+
+    progress.progress(1.0, text="Done ✅")
+
+    if not predictions:
+        st.error("None of the selected models produced predictions. Try a larger date range.")
+        st.stop()
+
+    # ---- Build an actual-only df (from the first prediction's merged actual) ----
+    first_pred = next(iter(predictions.values()))
+    actual_df = first_pred[["Timestamp", "Actual"]].copy()
+
+    # ---- Visualizations ----
+    st.subheader("📉 Actual vs Predictions")
+    fig = build_comparison_chart(actual_df, predictions, zone)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📐 Prediction Error")
+    fig_err = build_error_chart(predictions)
+    st.plotly_chart(fig_err, use_container_width=True)
+
+    # ---- Metrics table ----
+    st.subheader("📋 Model Metrics")
+    metrics_df = pd.DataFrame(metrics_table)
+    cols_order = ["Model", "MAPE (%)", "MAE", "RMSE", "R²"]
+    metrics_df = metrics_df[[c for c in cols_order if c in metrics_df.columns]]
+    metrics_df = metrics_df.sort_values("MAPE (%)", ascending=True).reset_index(drop=True)
+
+    st.dataframe(
+        metrics_df.style.format({
+            "MAPE (%)": "{:.2f}",
+            "MAE": "{:.2f}",
+            "RMSE": "{:.2f}",
+            "R²": "{:.4f}",
+        }).highlight_min(
+            subset=["MAPE (%)", "MAE", "RMSE"],
+            color="#d4edda",
+        ).highlight_max(
+            subset=["R²"],
+            color="#d4edda",
+        ),
+        use_container_width=True,
     )
 
-    model, scaler = _load_model_cached(model_name, entry_json)
+    with st.expander("📄 View raw predictions"):
+        for model_name, pred_df in predictions.items():
+            st.markdown(f"**{model_name}**")
+            st.dataframe(pred_df.head(200), use_container_width=True)
 
-    result_df = run_inference(model, scaler, df_filtered, zone)
+# ===================================================================
+# MODE B – Seasonal Blending
+# ===================================================================
+else:
+    # --- Model multi-select ---
+    selected_labels_b = st.sidebar.multiselect(
+        "Available Models",
+        options=list(label_to_name.keys()),
+        default=[],
+        key="blend_models",
+    )
+    selected_models_b = [label_to_name[lbl] for lbl in selected_labels_b]
 
-    if result_df.empty:
-        st.warning(f"No predictions for **{model_name}** — series may be too short for the model's input length.")
-        continue
+    # --- Fallback model ---
+    fallback_label = st.sidebar.selectbox(
+        "Fallback Model (fills gaps)",
+        options=selected_labels_b if selected_labels_b else [""],
+        index=0,
+        key="blend_fallback",
+    )
+    fallback_model = label_to_name.get(fallback_label, "")
 
-    predictions[model_name] = result_df
+    # --- Soft transition ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔀 Transition Settings")
+    enable_soft = st.sidebar.checkbox("Enable soft transition", value=False, key="blend_soft")
+    transition_days = 0
+    if enable_soft:
+        transition_days = st.sidebar.number_input(
+            "Transition window (days)", min_value=1, max_value=30, value=3, key="blend_td"
+        )
 
-    # Metrics
-    m = compute_metrics(result_df["Actual"].values, result_df["Predicted"].values)
-    m["Model"] = model_name
-    metrics_table.append(m)
+    # -----------------------------------------------------------------
+    # Schedule management (region-aware, session-state persisted)
+    # -----------------------------------------------------------------
+    if "blend_schedules" not in st.session_state:
+        st.session_state["blend_schedules"] = {z: [] for z in AVAILABLE_ZONES}
 
-progress.progress(1.0, text="Done ✅")
+    schedule_key = zone  # current region
+    schedule: list = st.session_state["blend_schedules"][schedule_key]
 
-if not predictions:
-    st.error("None of the selected models produced predictions. Try a larger date range.")
-    st.stop()
+    st.subheader("📅 Model Schedule Config")
+    st.caption(f"Region: **{zone}** — add schedule entries mapping date ranges to models.")
 
-# ---- Build an actual-only df (from the first prediction's merged actual) ----
-first_pred = next(iter(predictions.values()))
-actual_df = first_pred[["Timestamp", "Actual"]].copy()
+    # --- Add new entry form ---
+    with st.expander("➕ Add schedule entry", expanded=len(schedule) == 0):
+        acol1, acol2, acol3 = st.columns([2, 2, 3])
+        new_start = acol1.date_input("Segment start", value=start_date, min_value=min_date, max_value=max_date, key="new_seg_start")
+        new_end = acol2.date_input("Segment end", value=end_date, min_value=min_date, max_value=max_date, key="new_seg_end")
+        model_opts = selected_labels_b if selected_labels_b else ["(select models first)"]
+        new_model_label = acol3.selectbox("Assign model", options=model_opts, key="new_seg_model")
+        if st.button("Add Entry", key="add_entry_btn"):
+            if new_model_label in label_to_name and new_start < new_end:
+                schedule.append({
+                    "start": str(new_start),
+                    "end": str(new_end),
+                    "model": label_to_name[new_model_label],
+                })
+                st.session_state["blend_schedules"][schedule_key] = schedule
+                st.rerun()
+            else:
+                st.error("Invalid entry — ensure models are selected and start < end.")
 
-# ---------------------------------------------------------------------------
-# Visualizations
-# ---------------------------------------------------------------------------
-st.subheader("📉 Actual vs Predictions")
-fig = build_comparison_chart(actual_df, predictions, zone)
-st.plotly_chart(fig, use_container_width=True)
+    # --- Display current schedule ---
+    if schedule:
+        st.markdown("**Current schedule:**")
+        sched_display = []
+        for idx, entry in enumerate(schedule):
+            sched_display.append({
+                "#": idx + 1,
+                "Start": entry["start"],
+                "End": entry["end"],
+                "Model": entry["model"],
+            })
+        st.dataframe(pd.DataFrame(sched_display), use_container_width=True, hide_index=True)
 
-st.subheader("📐 Prediction Error")
-fig_err = build_error_chart(predictions)
-st.plotly_chart(fig_err, use_container_width=True)
+        # Remove entry
+        remove_idx = st.number_input(
+            "Remove entry # (0 = none)", min_value=0, max_value=len(schedule),
+            value=0, step=1, key="remove_idx",
+        )
+        if st.button("Remove", key="remove_entry_btn") and remove_idx > 0:
+            schedule.pop(remove_idx - 1)
+            st.session_state["blend_schedules"][schedule_key] = schedule
+            st.rerun()
+    else:
+        st.info("No schedule entries yet. Add one above.")
 
-# ---------------------------------------------------------------------------
-# Metrics table
-# ---------------------------------------------------------------------------
-st.subheader("📋 Model Metrics")
-metrics_df = pd.DataFrame(metrics_table)
-cols_order = ["Model", "MAPE (%)", "MAE", "RMSE", "R²"]
-metrics_df = metrics_df[[c for c in cols_order if c in metrics_df.columns]]
-metrics_df = metrics_df.sort_values("MAPE (%)", ascending=True).reset_index(drop=True)
+    # --- Run blending ---
+    run_blend = st.sidebar.button("🚀 Run Blending", type="primary", use_container_width=True)
 
-# Highlight best values
-st.dataframe(
-    metrics_df.style.format({
-        "MAPE (%)": "{:.2f}",
-        "MAE": "{:.2f}",
-        "RMSE": "{:.2f}",
-        "R²": "{:.4f}",
-    }).highlight_min(
-        subset=["MAPE (%)", "MAE", "RMSE"],
-        color="#d4edda",
-    ).highlight_max(
-        subset=["R²"],
-        color="#d4edda",
-    ),
-    use_container_width=True,
-)
+    if not selected_models_b:
+        st.info("Select models from the sidebar to begin.")
+        st.stop()
 
-# ---------------------------------------------------------------------------
-# Raw data expander
-# ---------------------------------------------------------------------------
-with st.expander("📄 View raw predictions"):
-    for model_name, pred_df in predictions.items():
-        st.markdown(f"**{model_name}**")
-        st.dataframe(pred_df.head(200), use_container_width=True)
+    if not schedule:
+        st.warning("Add at least one schedule entry before running.")
+        st.stop()
+
+    if not run_blend:
+        st.warning("Press **Run Blending** to generate merged predictions.")
+        st.stop()
+
+    if start_date >= end_date:
+        st.error("Start date must be before end date.")
+        st.stop()
+
+    if not fallback_model:
+        st.error("Select a fallback model.")
+        st.stop()
+
+    # --- Validate schedule ---
+    sched_warnings = validate_schedule(schedule, selected_models_b,
+                                       start_date, end_date)
+    for w in sched_warnings:
+        st.warning(f"⚠️ {w['message']}")
+
+    # --- Filter data ---
+    with st.spinner("Filtering data …"):
+        df_filtered_b = filter_data(
+            df_raw, zone, str(start_date), str(end_date),
+            months if months else None,
+        )
+
+    if df_filtered_b.empty:
+        st.error("No data found for the selected filters.")
+        st.stop()
+
+    st.caption(f"📊 Evaluation data: **{len(df_filtered_b):,}** rows from **{start_date}** to **{end_date}**")
+
+    # --- Run inference for each selected model ---
+    blend_predictions: dict[str, pd.DataFrame] = {}
+    progress_b = st.progress(0, text="Loading models & running inference …")
+
+    models_to_run = list(set(selected_models_b) | {fallback_model})
+    for i, mname in enumerate(models_to_run):
+        entry = registry.get(mname)
+        if entry is None:
+            st.warning(f"Model '{mname}' not found in registry.")
+            continue
+        entry_json = _json.dumps(entry)
+        progress_b.progress(i / len(models_to_run), text=f"Running **{mname}** ({i + 1}/{len(models_to_run)}) …")
+        mdl, scl = _load_model_cached(mname, entry_json)
+        res = run_inference(mdl, scl, df_filtered_b, zone)
+        if res.empty:
+            st.warning(f"No predictions for **{mname}** — series may be too short.")
+            continue
+        blend_predictions[mname] = res
+
+    progress_b.progress(1.0, text="Done ✅")
+
+    if fallback_model not in blend_predictions:
+        st.error("Fallback model produced no predictions. Try a larger date range.")
+        st.stop()
+
+    # --- Apply merge ---
+    if enable_soft and transition_days > 0:
+        merged_df = apply_soft_transition(
+            blend_predictions, schedule, fallback_model, transition_days
+        )
+    else:
+        merged_df = apply_hard_merge(blend_predictions, schedule, fallback_model)
+
+    if merged_df.empty:
+        st.error("Merge produced no results.")
+        st.stop()
+
+    # --- Actual DF ---
+    actual_df_b = merged_df[["Timestamp", "Actual"]].copy()
+
+    # --- Visualization ---
+    st.subheader("📉 Actual vs Blended Prediction")
+    show_indiv = st.checkbox("Show individual model predictions", value=True, key="show_indiv")
+    fig_blend = build_blending_chart(
+        actual_df_b, merged_df, blend_predictions, zone, schedule,
+        show_individuals=show_indiv,
+        transition_days=transition_days if enable_soft else 0,
+    )
+    st.plotly_chart(fig_blend, use_container_width=True)
+
+    st.subheader("📐 Blended Prediction Error")
+    fig_berr = build_blending_error_chart(merged_df)
+    st.plotly_chart(fig_berr, use_container_width=True)
+
+    # --- Metrics ---
+    st.subheader("📋 Overall Merged Metrics")
+    overall_m = compute_metrics(merged_df["Actual"].values, merged_df["Predicted"].values)
+    st.dataframe(
+        pd.DataFrame([overall_m]).style.format({
+            "MAPE (%)": "{:.2f}", "MAE": "{:.2f}", "RMSE": "{:.2f}", "R²": "{:.4f}",
+        }),
+        use_container_width=True,
+    )
+
+    # --- Per-segment metrics ---
+    st.subheader("📊 Per-Segment Metrics")
+    seg_metrics = compute_segment_metrics(merged_df, schedule, fallback_model)
+    if not seg_metrics.empty:
+        st.dataframe(
+            seg_metrics.style.format({
+                "MAPE (%)": "{:.2f}", "MAE": "{:.2f}", "RMSE": "{:.2f}", "R²": "{:.4f}",
+            }),
+            use_container_width=True,
+        )
+
+    # --- Contribution summary ---
+    st.subheader("🧩 Model Contribution Summary")
+    contrib = compute_contribution_summary(merged_df)
+    if not contrib.empty:
+        st.dataframe(contrib, use_container_width=True, hide_index=True)
+
+    # --- Raw merged data ---
+    with st.expander("📄 View merged predictions"):
+        st.dataframe(merged_df.head(500), use_container_width=True)
