@@ -39,7 +39,10 @@ from data_loader import (
 )
 from inference import compute_metrics, run_inference
 from model_loader import (
+    discover_models_in_directory,
+    get_available_zones,
     list_models,
+    load_all_registries,
     load_model,
     load_registry,
     load_scaler,
@@ -69,6 +72,36 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Dark-mode CSS overrides (tables, backgrounds, text)
+# ---------------------------------------------------------------------------
+_DARK_CSS = """
+<style>
+/* Ensure dataframe text stays visible on dark bg */
+.stDataFrame td, .stDataFrame th {
+    color: #FAFAFA !important;
+}
+/* Subtle border between rows */
+.stDataFrame tr {
+    border-bottom: 1px solid #2A2D35;
+}
+/* Expander header */
+details summary {
+    color: #FAFAFA !important;
+}
+/* Metric cards */
+[data-testid="stMetric"] {
+    background-color: #1A1C23;
+    border-radius: 8px;
+    padding: 12px;
+}
+</style>
+"""
+st.markdown(_DARK_CSS, unsafe_allow_html=True)
+
+# Dark-friendly highlight colour for best-metric cells
+_HIGHLIGHT_BEST = "#1B4332"  # muted green on dark bg
+
+# ---------------------------------------------------------------------------
 # Cached loaders
 # ---------------------------------------------------------------------------
 
@@ -79,7 +112,7 @@ def _load_data():
 
 @st.cache_data(show_spinner="Loading model registry …")
 def _load_registry():
-    return load_registry()
+    return load_all_registries()
 
 
 @st.cache_resource(show_spinner="Loading model checkpoint …")
@@ -99,6 +132,31 @@ registry = _load_registry()
 model_names = list_models(registry)
 
 min_date, max_date = get_date_bounds(df_raw)
+
+# ---------------------------------------------------------------------------
+# Sidebar – optional directory-based model loading
+# ---------------------------------------------------------------------------
+with st.sidebar.expander("📂 Load models from directory", expanded=False):
+    dir_path_str = st.text_input(
+        "Model directory path",
+        value=str(_PROJECT_ROOT / "models"),
+        key="model_dir_path",
+    )
+    if st.button("Scan directory", key="scan_dir_btn"):
+        scan_dir = Path(dir_path_str)
+        if not scan_dir.is_dir():
+            st.error("Directory does not exist.")
+        else:
+            discovered = discover_models_in_directory(scan_dir)
+            if not discovered:
+                st.warning("No valid model artifacts found in this directory.")
+            else:
+                # Merge discovered models into registry (discovered takes precedence)
+                new_count = sum(1 for k in discovered if k not in registry)
+                registry.update(discovered)
+                model_names = list_models(registry)
+                st.success(f"Found **{len(discovered)}** models ({new_count} new).")
+                st.rerun()
 
 # ---------------------------------------------------------------------------
 # Sidebar – mode switch
@@ -136,8 +194,22 @@ months = st.sidebar.multiselect(
 st.sidebar.markdown("---")
 st.sidebar.header("🧠 Model Selection")
 
-# Build display labels
-display_labels = {name: model_display_label(name, registry[name]) for name in model_names}
+# Zone filter for models
+_model_zones = get_available_zones(registry)
+model_zone_filter = st.sidebar.selectbox(
+    "Filter models by zone",
+    options=["All Zones"] + _model_zones,
+    index=0,
+    key="model_zone_filter",
+)
+
+# Build display labels, apply zone filter
+if model_zone_filter == "All Zones":
+    _filtered_names = model_names
+else:
+    _filtered_names = [n for n in model_names if registry[n].get("zone") == model_zone_filter]
+
+display_labels = {name: model_display_label(name, registry[name]) for name in _filtered_names}
 label_to_name = {v: k for k, v in display_labels.items()}
 
 import json as _json
@@ -146,10 +218,26 @@ import json as _json
 # MODE A – Model Comparison  (original flow, untouched)
 # ===================================================================
 if app_mode == "📈 Model Comparison":
+    # --- Select All / Clear helpers ---
+    _cmp_options = list(label_to_name.keys())
+    sa_col1, sa_col2 = st.sidebar.columns(2)
+    if sa_col1.button("✅ Select All", key="sel_all_cmp", use_container_width=True):
+        st.session_state["cmp_models"] = _cmp_options
+        st.rerun()
+    if sa_col2.button("❌ Clear", key="clr_all_cmp", use_container_width=True):
+        st.session_state["cmp_models"] = []
+        st.rerun()
+
+    # Remove stale selections that are no longer in the filtered options
+    if "cmp_models" in st.session_state:
+        st.session_state["cmp_models"] = [
+            lbl for lbl in st.session_state["cmp_models"] if lbl in label_to_name
+        ]
+
     selected_labels = st.sidebar.multiselect(
         "Choose models to compare",
-        options=list(label_to_name.keys()),
-        default=[],
+        options=_cmp_options,
+        key="cmp_models",
     )
     selected_models = [label_to_name[lbl] for lbl in selected_labels]
 
@@ -246,10 +334,10 @@ if app_mode == "📈 Model Comparison":
             "R²": "{:.4f}",
         }).highlight_min(
             subset=["MAPE (%)", "MAE", "RMSE"],
-            color="#d4edda",
+            color=_HIGHLIGHT_BEST,
         ).highlight_max(
             subset=["R²"],
-            color="#d4edda",
+            color=_HIGHLIGHT_BEST,
         ),
         use_container_width=True,
     )
@@ -263,11 +351,25 @@ if app_mode == "📈 Model Comparison":
 # MODE B – Seasonal Blending
 # ===================================================================
 else:
-    # --- Model multi-select ---
+    # --- Model multi-select with Select All / Clear ---
+    _bld_options = list(label_to_name.keys())
+    sa_b1, sa_b2 = st.sidebar.columns(2)
+    if sa_b1.button("✅ Select All", key="sel_all_bld", use_container_width=True):
+        st.session_state["blend_models"] = _bld_options
+        st.rerun()
+    if sa_b2.button("❌ Clear", key="clr_all_bld", use_container_width=True):
+        st.session_state["blend_models"] = []
+        st.rerun()
+
+    # Remove stale selections that are no longer in the filtered options
+    if "blend_models" in st.session_state:
+        st.session_state["blend_models"] = [
+            lbl for lbl in st.session_state["blend_models"] if lbl in label_to_name
+        ]
+
     selected_labels_b = st.sidebar.multiselect(
         "Available Models",
-        options=list(label_to_name.keys()),
-        default=[],
+        options=_bld_options,
         key="blend_models",
     )
     selected_models_b = [label_to_name[lbl] for lbl in selected_labels_b]

@@ -7,9 +7,13 @@ import pandas as pd
 import plotly.graph_objects as go
 
 
+# Consistent dark template for all charts
+_PLOTLY_TEMPLATE = "plotly_dark"
+_ACTUAL_LINE_COLOR = "#FF0000"  # high-contrast on dark bg
+
 # Distinct colour palette for model traces
 _COLORS = [
-    "#EF553B", "#636EFA", "#00CC96", "#AB63FA", "#FFA15A",
+    "#531C12", "#636EFA", "#00CC96", "#AB63FA", "#FFA15A",
     "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
 ]
 
@@ -36,7 +40,7 @@ def build_comparison_chart(
         y=actual_df["Actual"],
         mode="lines",
         name="Actual",
-        line=dict(color="black", width=2),
+        line=dict(color=_ACTUAL_LINE_COLOR, width=2),
     ))
 
     # One trace per model
@@ -52,6 +56,7 @@ def build_comparison_chart(
         ))
 
     fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
         title=f"Actual vs Predictions — {zone}",
         xaxis_title="Timestamp",
         yaxis_title="Demand",
@@ -82,6 +87,7 @@ def build_error_chart(
         ))
 
     fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
         title="Prediction Error Over Time",
         xaxis_title="Timestamp",
         yaxis_title="Error (Predicted − Actual)",
@@ -134,7 +140,7 @@ def build_blending_chart(
         y=actual_df["Actual"],
         mode="lines",
         name="Actual",
-        line=dict(color="black", width=2),
+        line=dict(color=_ACTUAL_LINE_COLOR, width=2),
     ))
 
     # Merged prediction
@@ -189,6 +195,7 @@ def build_blending_chart(
             )
 
     fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
         title=f"Seasonal Blending — {zone}",
         xaxis_title="Timestamp",
         yaxis_title="Demand",
@@ -214,6 +221,7 @@ def build_blending_error_chart(
             line=dict(color="#EF553B", width=1),
         ))
     fig.update_layout(
+        template=_PLOTLY_TEMPLATE,
         title="Blended Prediction Error Over Time",
         xaxis_title="Timestamp",
         yaxis_title="Error (Predicted − Actual)",
