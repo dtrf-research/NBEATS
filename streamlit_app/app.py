@@ -61,6 +61,7 @@ from seasonal_blending import (
     compute_segment_metrics,
     validate_schedule,
 )
+from metrics_explorer import explore_metrics
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -124,6 +125,16 @@ def _load_model_cached(model_name: str, _entry_json: str):
     scaler = load_scaler(entry)
     return model, scaler
 
+
+def load_marked_models() -> dict:
+    """Load marked models from metrics explorer selection."""
+    marked_file = Path(__file__).parent / ".selected_models.json"
+    if marked_file.exists():
+        import json as _json
+        with open(marked_file, "r") as f:
+            return _json.load(f)
+    return {}
+
 # ---------------------------------------------------------------------------
 # Data & registry
 # ---------------------------------------------------------------------------
@@ -163,54 +174,70 @@ with st.sidebar.expander("📂 Load models from directory", expanded=False):
 # ---------------------------------------------------------------------------
 app_mode = st.sidebar.radio(
     "Dashboard Mode",
-    ["📈 Model Comparison", "🌾 Seasonal Blending"],
+    ["📈 Model Comparison", "🌾 Seasonal Blending", "📊 Metrics Explorer"],
     index=0,
-    horizontal=True,
+    horizontal=False,
 )
+
+# Show marked models quick access
+marked_models = load_marked_models()
+if marked_models and app_mode != "📊 Metrics Explorer":
+    with st.sidebar.expander("⭐ Marked Models", expanded=True):
+        st.caption("Quick access to models marked in Metrics Explorer")
+        for zone, models in marked_models.items():
+            if models:
+                st.write(f"**{zone}** ({len(models)})")
+                for m in models:
+                    st.caption(f"→ {m[:40]}...")
 
 if app_mode == "📈 Model Comparison":
     st.title("📈 N-BEATS Model Comparison Dashboard")
-else:
+elif app_mode == "🌾 Seasonal Blending":
     st.title("🌾 Seasonal Model Blending")
+else:
+    st.title("📊 Model Metrics Explorer")
 
 # ---------------------------------------------------------------------------
 # Sidebar – controls
 # ---------------------------------------------------------------------------
-st.sidebar.header("⚙️ Evaluation Settings")
+# Only show evaluation settings for Model Comparison and Seasonal Blending modes
+if app_mode != "📊 Metrics Explorer":
+    st.sidebar.header("⚙️ Evaluation Settings")
 
-zone = st.sidebar.selectbox("Region / Zone", AVAILABLE_ZONES, index=0)
+    zone = st.sidebar.selectbox("Region / Zone", AVAILABLE_ZONES, index=0)
 
-col_d1, col_d2 = st.sidebar.columns(2)
-start_date = col_d1.date_input("Start date", value=pd.Timestamp("2025-01-01").date(), min_value=min_date, max_value=max_date)
-end_date = col_d2.date_input("End date", value=max_date, min_value=min_date, max_value=max_date)
+    col_d1, col_d2 = st.sidebar.columns(2)
+    start_date = col_d1.date_input("Start date", value=pd.Timestamp("2025-01-01").date(), min_value=min_date, max_value=max_date)
+    end_date = col_d2.date_input("End date", value=max_date, min_value=min_date, max_value=max_date)
 
-months = st.sidebar.multiselect(
-    "Months (leave empty for all)",
-    options=list(range(1, 13)),
-    format_func=lambda m: MONTH_NAMES[m],
-    default=[],
-)
+    months = st.sidebar.multiselect(
+        "Months (leave empty for all)",
+        options=list(range(1, 13)),
+        format_func=lambda m: MONTH_NAMES[m],
+        default=[],
+    )
 
-st.sidebar.markdown("---")
-st.sidebar.header("🧠 Model Selection")
+    st.sidebar.markdown("---")
+    st.sidebar.header("🧠 Model Selection")
 
-# Zone filter for models
-_model_zones = get_available_zones(registry)
-model_zone_filter = st.sidebar.selectbox(
-    "Filter models by zone",
-    options=["All Zones"] + _model_zones,
-    index=0,
-    key="model_zone_filter",
-)
+    # Zone filter for models
+    _model_zones = get_available_zones(registry)
+    model_zone_filter = st.sidebar.selectbox(
+        "Filter models by zone",
+        options=["All Zones"] + _model_zones,
+        index=0,
+        key="model_zone_filter",
+    )
 
-# Build display labels, apply zone filter
-if model_zone_filter == "All Zones":
-    _filtered_names = model_names
-else:
-    _filtered_names = [n for n in model_names if registry[n].get("zone") == model_zone_filter]
+    # Build display labels, apply zone filter
+    if model_zone_filter == "All Zones":
+        _filtered_names = model_names
+    else:
+        _filtered_names = [n for n in model_names if registry[n].get("zone") == model_zone_filter]
 
-display_labels = {name: model_display_label(name, registry[name]) for name in _filtered_names}
-label_to_name = {v: k for k, v in display_labels.items()}
+    display_labels = {name: model_display_label(name, registry[name]) for name in _filtered_names}
+    label_to_name = {v: k for k, v in display_labels.items()}
+
 
 import json as _json
 
@@ -350,7 +377,7 @@ if app_mode == "📈 Model Comparison":
 # ===================================================================
 # MODE B – Seasonal Blending
 # ===================================================================
-else:
+elif app_mode == "🌾 Seasonal Blending":
     # --- Model multi-select with Select All / Clear ---
     _bld_options = list(label_to_name.keys())
     sa_b1, sa_b2 = st.sidebar.columns(2)
@@ -571,3 +598,9 @@ else:
     # --- Raw merged data ---
     with st.expander("📄 View merged predictions"):
         st.dataframe(merged_df.head(500), use_container_width=True)
+
+# ===================================================================
+# MODE C – Metrics Explorer
+# ===================================================================
+elif app_mode == "📊 Metrics Explorer":
+    explore_metrics()
